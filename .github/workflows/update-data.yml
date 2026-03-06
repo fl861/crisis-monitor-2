@@ -1,0 +1,247 @@
+name: Update Crisis Monitor Data
+
+on:
+  schedule:
+    # 每30分钟运行一次
+    - cron: '*/30 * * * *'
+  workflow_dispatch:  # 手动触发
+  push:
+    branches: [ main ]
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        
+      - name: Fetch market data and update charts
+        env:
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+          ALPHA_VANTAGE_KEY: ${{ secrets.ALPHA_VANTAGE_KEY }}
+        run: |
+          # 使用Python获取数据并生成历史数据文件
+          pip install requests
+          
+          python3 << 'PYEOF'
+          import requests
+          import json
+          from datetime import datetime, timedelta
+          
+          fred_key = "${{ secrets.FRED_API_KEY }}"
+          av_key = "${{ secrets.ALPHA_VANTAGE_KEY }}"
+          
+          data = {
+              'timestamp': datetime.utcnow().isoformat() + 'Z',
+              'indicators': {}
+          }
+          
+          # Fetch FRED data
+          def fetch_fred(series_id, days=30):
+              try:
+                  end_date = datetime.now().strftime('%Y-%m-%d')
+                  start_date = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
+                  url = f"https://api.stlouisfed.org/fred/series/observations"
+                  params = {
+                      "series_id": series_id,
+                      "api_key": fred_key,
+                      "file_type": "json",
+                      "observation_start": start_date,
+                      "observation_end": end_date
+                  }
+                  resp = requests.get(url, params=params, timeout=15)
+                  result = resp.json()
+                  if 'observations' in result:
+                      return [(o['date'], float(o['value'])) for o in result['observations'] if o['value'] != '.']
+              except Exception as e:
+                  print(f"Error fetching {series_id}: {e}")
+              return []
+          
+          # Fetch VIX from Alpha Vantage
+          def fetch_vix():
+              try:
+                  url = f"https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol=VIX&apikey={av_key}&outputsize=compact"
+                  resp = requests.get(url, timeout=15)
+                  result = resp.json()
+                  if 'Time Series (Daily)' in result:
+                      ts = result['Time Series (Daily)']
+                      return [(d, float(v['4. close'])) for d, v in sorted(ts.items(), reverse=True)[:30]]
+              except Exception as e:
+                  print(f"Error fetching VIX: {e}")
+              return []
+          
+          # Get data
+          ss3y = fetch_fred('DSWP3')
+          ss5y = fetch_fred('DSWP5')
+          dgs10 = fetch_fred('DGS10')
+          ted = fetch_fred('TEDRATE')
+          vix = fetch_vix()
+          
+          # Store historical data
+          data['historical'] = {
+              'swap_spread_3y': ss3y,
+              'swap_spread_5y': ss5y,
+              'treasury_10y': dgs10,
+              'ted_spread': ted,
+              'vix': vix
+          }
+          
+          # Latest values
+          if ss3y:
+              latest = ss3y[-1]
+              prev = ss3y[-2] if len(ss3y) > 1 else ss3y[-1]
+              data['indicators']['swap_spread_3y'] = {
+                  'value': latest[1],
+                  'change': latest[1] - prev[1],
+                  'date': latest[0],
+                  'source': 'FRED - DSWP3'
+              }
+          
+          if ss5y:
+              latest = ss5y[-1]
+              data['indicators']['swap_spread_5y'] = {
+                  'value': latest[1],
+                  'date': latest[0],
+                  'source': 'FRED - DSWP5'
+              }
+          
+          if vix:
+              latest = vix[0]
+              data['indicators']['vix'] = {
+                  'value': latest[1],
+                  'date': latest[0],
+                  'source': 'Alpha Vantage'
+              }
+          
+          if dgs10:
+              latest = dgs10[-1]
+              data['indicators']['treasury_10y'] = {
+                  'value': latest[1],
+                  'date': latest[0],
+                  'source': 'FRED - DGS10'
+              }
+          
+          if ted:
+              latest = ted[-1]
+              data['indicators']['ted_spread'] = {
+                  'value': latest[1],
+                  'date': latest[0],
+                  'source': 'FRED - TEDRATE'
+              }
+          
+          # Calculate risks
+          def calc_ss_risk(v):
+              if v is None: return {'level': 'unknown', 'status': '无数据'}
+              if v > -20: return {'level': 'normal', 'status': '正常'}
+              if v > -30: return {'level': 'warning', 'status': '警戒'}
+              if v > -40: return {'level': 'danger', 'status': '危险'}
+              return {'level': 'critical', 'status': '紧急'}
+          
+          def calc_vix_risk(v):
+              if v is None: return {'level': 'unknown', 'status': '无数据'}
+              if v < 15: return {'level': 'normal', 'status': '平静'}
+              if v < 20: return {'level': 'warning', 'status': '略高'}
+              if v < 30: return {'level': 'danger', 'status': '恐慌'}
+              return {'level': 'critical', 'status': '极端恐慌'}
+          
+          ss3y_val = data['indicators'].get('swap_spread_3y', {}).get('value')
+          vix_val = data['indicators'].get('vix', {}).get('value')
+          
+          data['indicators']['swap_spread_3y']['risk'] = calc_ss_risk(ss3y_val)
+          data['indicators']['vix']['risk'] = calc_vix_risk(vix_val)
+          
+          # Overall risk
+          scores = {'normal': 0, 'warning': 1, 'danger': 2, 'critical': 3, 'unknown': 1}
+          ss_score = scores.get(data['indicators']['swap_spread_3y']['risk']['level'], 1)
+          vix_score = scores.get(data['indicators']['vix']['risk']['level'], 1)
+          score = ss_score * 0.55 + vix_score * 0.45
+          
+          if score < 0.5:
+              overall = {'level': 'normal', 'status': '正常', 'advice': '市场运行正常'}
+          elif score < 1.2:
+              overall = {'level': 'warning', 'status': '警戒', 'advice': '市场有压力迹象，需密切关注'}
+          elif score < 2.0:
+              overall = {'level': 'danger', 'status': '危险', 'advice': '危机信号明显，建议降低仓位'}
+          else:
+              overall = {'level': 'critical', 'status': '紧急', 'advice': '系统性风险可能，建议避险'}
+          
+          data['overall_risk'] = overall
+          
+          with open('data.json', 'w') as f:
+              json.dump(data, f, indent=2, ensure_ascii=False)
+          
+          print(f"✅ 数据更新完成: {datetime.utcnow()}")
+          print(f"   Swap Spread 3Y: {ss3y_val}")
+          print(f"   VIX: {vix_val}")
+          print(f"   综合风险: {overall['status']}")
+          PYEOF
+          
+      - name: Commit and push data
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add data.json
+          git diff --quiet && git diff --staged --quiet || git commit -m "Update crisis monitor data - $(date -u '+%Y-%m-%d %H:%M UTC')"
+          git push
+          
+      - name: Send alert if critical
+        env:
+          FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
+        run: |
+          if [ -f data.json ]; then
+            python3 << 'PYEOF'
+          import requests
+          import json
+          import os
+          
+          webhook = os.environ.get('FEISHU_WEBHOOK', '')
+          if not webhook:
+              print("⚠️ 未配置飞书Webhook")
+              exit(0)
+          
+          with open('data.json', 'r') as f:
+              data = json.load(f)
+          
+          level = data.get('overall_risk', {}).get('level', 'unknown')
+          
+          if level in ['danger', 'critical']:
+              ss3y = data['indicators'].get('swap_spread_3y', {})
+              vix = data['indicators'].get('vix', {})
+              
+              content = f"""## 🚨 锦成盛危机监测警报
+
+**状态**: {data['overall_risk']['status']}
+**建议**: {data['overall_risk']['advice']}
+
+---
+
+**Swap Spread (3Y)**: {ss3y.get('value', 'N/A')} bp
+- 变化: {ss3y.get('change', 'N/A')}
+- 状态: {ss3y.get('risk', {}).get('status', 'N/A')}
+- 来源: {ss3y.get('source', 'N/A')}
+
+**VIX**: {vix.get('value', 'N/A')}
+- 状态: {vix.get('risk', {}).get('status', 'N/A')}
+- 来源: {vix.get('source', 'N/A')}
+
+---
+⏰ {data.get('timestamp', '')}"""
+              
+              card = {
+                  "msg_type": "interactive",
+                  "card": {
+                      "header": {
+                          "title": {"tag": "plain_text", "content": f"🚨 危机监测警报 [{data['overall_risk']['status']}]"},
+                          "template": "red" if level == 'critical' else "orange"
+                      },
+                      "elements": [{"tag": "div", "text": {"tag": "lark_md", "content": content}}]
+                  }
+              }
+              
+              requests.post(webhook, json=card, timeout=10)
+              print(f"✅ 警报已发送")
+          else:
+              print(f"✅ 状态正常: {level}")
+          PYEOF
+          fi
